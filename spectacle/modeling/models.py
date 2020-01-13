@@ -34,16 +34,24 @@ class Spectral1D(Fittable1DModel):
         either a string, in which case the line information is retrieve from the
         ion registry; an instance of :class:`~OpticalDepth1D`; or a list of
         either of the previous two types.
-    continuum : :class:`~Fittable1DModel`, optional
+    continuum : :class:`~Fittable1DModel`
         An astropy model representing the continuum of the spectrum. If not
-        provided, a :class:`~Const1D` model is used.
-    z : float, optional
+        provided, a :class:`~Const1D` model is used. Default = 0.
+    z : float
         The redshift applied to the spectral model. Default = 0.
     lsf : :class:`~spectacle.modeling.lsfs.LSFModel`, :class:`~astropy.convolution.Kernel1D`, str, optional
         The line spread function applied to the spectral model. It can be a
         pre-defined kernel model, or a convolution kernel, or a string
         referencing the built-in Hubble COS lsf, or a Gaussian lsf. Optional
         keyword arguments can be passed through.
+    output : {'optical_depth', 'flux', 'flux_decrement'}
+        The expected output when evaluating the model object. Default =
+        'optical_depth'.
+    velocity_convention : {'optical', 'radio', 'relativistic'}
+        The velocity convention to use when converting between wavelength and
+        velocity space dispersion values. Default = 'relativistic'.
+    rest_wavelength : :class:`~astropy.units.Quantity`
+        The rest value of the spectral data, used in velocity conversions.
     """
     inputs = ('x',)
     outputs = ('y',)
@@ -253,7 +261,8 @@ class Spectral1D(Fittable1DModel):
 
         return self._compound_model(x)
 
-    def rejection_criteria(self, x, y, auto_fit=True):
+    def rejection_criteria(self, x, y, auto_fit=True, fitter=None,
+                           fitter_args=None):
         """
         Implementation of the Akaike Information Criteria with Correction
         (AICC) (Akaike 1974; Liddle 2007; King et al. 2011). Used to determine
@@ -269,6 +278,8 @@ class Spectral1D(Fittable1DModel):
         auto_fit : bool
             Whether the model fit should be re-evaluated for every removed
             line.
+        fitter : :class:`~astropy.modeling.fitting.Fitter`
+            Astropy fitter class used when fitting model to data.
 
         Returns
         -------
@@ -278,6 +289,7 @@ class Spectral1D(Fittable1DModel):
         base_aicc, chi2, cmplx = self._aicc(x, y, self)
         final_model = self
         finished = False
+        fitter = fitter or LevMarLSQFitter()
 
         while not finished:
             for i in range(len(final_model.lines)):
@@ -291,8 +303,7 @@ class Spectral1D(Fittable1DModel):
                 new_spec = self._copy(lines=lines)
 
                 if auto_fit:
-                    fitter = LevMarLSQFitter()
-                    new_spec = fitter(new_spec, x, y)
+                    new_spec = fitter(new_spec, x, y, **fitter_args)
 
                 aicc, chi2, cmplx = self._aicc(x, y, new_spec)
 

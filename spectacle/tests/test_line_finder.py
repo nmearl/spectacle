@@ -133,3 +133,30 @@ def test_detection(spectral_model):
     assert np.allclose([(508, 565), (583, 620), (256, 277), (534, 565),
                         (583, 605), (642, 679)],
                         list(reg_bnds.keys()))
+
+
+def test_aicc():
+    line1 = OpticalDepth1D(lambda_0=1216 * u.AA, v_doppler=10 * u.km / u.s,
+                           column_density=13, delta_v=0 * u.km / u.s)
+    line2 = OpticalDepth1D("HI1216", delta_v=0 * u.km / u.s,
+                           v_doppler=70 * u.km / u.s)
+
+    spec_mod = Spectral1D([line1, line2], z=0, continuum=0,
+                          output='flux')
+
+    x = np.linspace(-200, 200, 1000) * u.km / u.s
+    y = spec_mod(x)
+
+    line_finder = LineFinder1D(ions=["HI1216"], auto_fit=False,
+                           continuum=0, output='flux',
+                           threshold=0.05)
+
+    fit_spec_mod = line_finder(x, y)
+
+    assert len(fit_spec_mod).lines == 3
+
+    new_spec, base_aicc, chi2, cmplx = fit_spec_mod.rejection_criteria(
+        x, y, auto_fit=True)
+
+    assert len(new_spec.lines) == 2
+

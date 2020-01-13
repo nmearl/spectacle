@@ -18,6 +18,33 @@ TAU_FACTOR = (np.sqrt(np.pi) * e.esu ** 2 /
 
 
 class LineFinder1D(Fittable2DModel):
+    """
+    The line finder class used to discover ion profiles within spectral data.
+
+    Parameters
+    ----------
+    ions : list
+        The list of ions to consider when discovering centroids. Each found
+        centroid will be assigned an ion from this list, or the entire
+        ion database if no filter is provided.
+    continuum : float, :class:`~astropy.modeling.fitting.Fittable1DModel`
+        Either a value representing the continuum's constant value, or an
+        astropy fittable model representing the continuum. Used in fitting and
+        added to the final spectral model produced by the operation.
+    defaults : dict
+        Dictionary containing key-value pairs when the key is the parameter
+        name accepted by the :class:`~Spectral1D` class. If a parameter is
+        defined this way, the fitter will use it instead of the fitted
+        parameter value.
+    z : float
+        The redshift applied to the spectral model. Default = 0.
+    output : {'optical_depth', 'flux', 'flux_decrement'}
+        The expected output when evaluating the model object. Default =
+        'optical_depth'.
+    velocity_convention : {'optical', 'radio', 'relativistic'}
+        The velocity convention to use when converting between wavelength and
+        velocity space dispersion values. Default = 'relativistic'.
+    """
     inputs = ('x', 'y')
     outputs = ('y',)
 
@@ -29,9 +56,9 @@ class LineFinder1D(Fittable2DModel):
     min_distance = Parameter(default=10.0, min=1, fixed=True)
 
     def __init__(self, ions=None, continuum=None, defaults=None, z=None,
-                 auto_fit=True, velocity_convention='relativistic',
-                 output='flux', fitter=None, with_rejection=False,
-                 fitter_args=None, *args, **kwargs):
+                 auto_fit=True, output='flux',
+                 velocity_convention='relativistic', fitter=None,
+                 with_rejection=False, fitter_args=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._ions = ions or []
@@ -168,8 +195,9 @@ class LineFinder1D(Fittable2DModel):
             line = OpticalDepth1D(**line_kwargs)
             lines.append(line)
 
-        logging.debug("Found %s possible lines (theshold=%s, min_distance=%s).",
-                      len(lines), threshold, min_distance)
+        logging.debug(
+            "Found %s possible lines (theshold=%s, min_distance=%s).",
+            len(lines), threshold, min_distance)
 
         if len(lines) == 0:
             return np.zeros(x.shape)
@@ -184,10 +212,19 @@ class LineFinder1D(Fittable2DModel):
                 if 'maxiter' not in self._fitter_args:
                     self._fitter_args['maxiter'] = 1000
 
-            fit_spec_mod = self._fitter(spec_mod, self._redshift_model(x),
-                                        y, **self._fitter_args)
+            if self._with_rejection:
+                fit_spec_mod, _, _, _ = fit_spec_mod.rejection_criteria(
+                    self._redshift_model(x), y, auto_fit=True,
+                    fitter=self._fitter, fitter_args=self._fitter_args)
+            else:
+                fit_spec_mod = self._fitter(spec_mod, self._redshift_model(x),
+                                            y, **self._fitter_args)
         else:
-            fit_spec_mod = spec_mod
+            if self._with_rejection:
+                fit_spec_mod, _, _, _ = fit_spec_mod.rejection_criteria(
+                    self._redshift_model(x), y, auto_fit=False)
+            else:
+                fit_spec_mod = spec_mod
 
         # The parameter values on the underlying compound model must also be
         # updated given the new fitted parameters on the Spectral1D instance.
