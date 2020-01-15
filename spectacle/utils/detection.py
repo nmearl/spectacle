@@ -90,6 +90,10 @@ def _find_ternary_bounds(x, ddS_mask, dddS_mask, min_distance, is_absorption):
         # dispersion value for the centroid.
         lower_x_ddS, upper_x_ddS = x.value[lower_ind], \
                                      x.value[upper_ind]
+
+        if lower_ind == 0 or upper_ind == x.size - 1:
+            continue
+
         x_dddS = x[tind]
 
         # if is_absorption:
@@ -144,11 +148,15 @@ def _find_primary_bounds(x, dS_mask, ddS_mask, min_distance, is_absorption):
     return prime_regions
 
 
+def profile_type(x, y):
+    mid_y = min(y) + (max(y) - min(y)) * 0.5
+    return 'absorption' if len(y[y > mid_y]) > len(y[y < mid_y]) else 'emission'
+
+
 def region_bounds(x, y, threshold=0.001, min_distance=1):
     # Slice the y axis in half -- if more data elements exist in the "top"
     # half, assume the spectrum is absorption. Otherwise, assume emission.
-    mid_y = min(y) + (max(y) - min(y)) * 0.5
-    is_absorption = len(y[y > mid_y]) > len(y[y < mid_y])
+    is_absorption = profile_type(x, y) == 'absorption'
 
     if not isinstance(min_distance, u.Quantity):
         min_distance *= x.unit

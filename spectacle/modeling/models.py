@@ -294,7 +294,12 @@ class Spectral1D(Fittable1DModel):
         while not finished:
             for i in range(len(final_model.lines)):
                 lines = [x for x in final_model.lines]
-                removed_line = lines.pop(i)
+
+                # Skip the first iteration so if the user has set auto_fit,
+                #  the remaining iterations will use the fittted model to
+                #  evaluate individual lines.
+                if i > 0:
+                    removed_line = lines.pop(i)
 
                 if len(lines) == 0:
                     finished = True
@@ -303,7 +308,7 @@ class Spectral1D(Fittable1DModel):
                 new_spec = self._copy(lines=lines)
 
                 if auto_fit:
-                    new_spec = fitter(new_spec, x, y, **fitter_args)
+                    new_spec = fitter(new_spec, x, y, **(fitter_args or {}))
 
                 aicc, chi2, cmplx = self._aicc(x, y, new_spec)
 

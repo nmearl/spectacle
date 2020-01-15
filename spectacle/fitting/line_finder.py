@@ -9,7 +9,7 @@ from astropy.modeling.models import RedshiftScaleFactor
 
 from .curve_fitter import CurveFitter
 from ..modeling import OpticalDepth1D, Spectral1D
-from ..utils.detection import region_bounds
+from ..utils.detection import region_bounds, profile_type
 from ..utils.misc import DOPPLER_CONVERT
 from ..registries import line_registry
 
@@ -58,7 +58,7 @@ class LineFinder1D(Fittable2DModel):
     def __init__(self, ions=None, continuum=None, defaults=None, z=None,
                  auto_fit=True, output='flux',
                  velocity_convention='relativistic', fitter=None,
-                 with_rejection=False, fitter_args=None, *args, **kwargs):
+                 auto_reject=False, fitter_args=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._ions = ions or []
@@ -71,7 +71,7 @@ class LineFinder1D(Fittable2DModel):
         self._velocity_convention = velocity_convention
         self._fitter_args = fitter_args or {}
         self._fitter = fitter or CurveFitter()
-        self._with_rejection = with_rejection
+        self._auto_reject = auto_reject
 
     @property
     def model_result(self):
@@ -117,8 +117,75 @@ class LineFinder1D(Fittable2DModel):
         # Find peaks
         regions = region_bounds(x, y, threshold=threshold,
                                 min_distance=min_distance)
+
+        # First, generate profiles based on all the primary peaks
+        prime_lines = self._discover_lines(
+            x, y, spec_mod, sub_registry,
+            {k: v for k, v in regions.items() if not v[3]},
+            threshold, min_distance)
+
+        prime_mod = Spectral1D(prime_lines,
+                               continuum=0,
+                               output='optical_depth',
+                               z=self._redshift_model.z.value)
+
+        # Second, mask out the input data based on the found primary peaks,
+        # then fit the buried lines.
+        py = prime_mod(x)
+
+        thresh_mask = np.greater(py/np.max(py), 0.0001)
+        px, py = x[~thresh_mask], y[~thresh_mask]
+        my = np.interp(x, px, py)
+
+        tern_lines = self._discover_lines(
+            x, my, spec_mod, sub_registry,
+            {k: v for k, v in regions.items() if v[3]},
+            threshold, min_distance)
+
+        # Generate the final spectral model
+        spec_mod = Spectral1D(prime_lines + tern_lines,
+                              continuum=self._continuum,
+                              output=self._output,
+                              z=self._redshift_model.z.value)
+
+        if self._auto_fit:
+            if issubclass(self._fitter.__class__, LevMarLSQFitter):
+                if 'maxiter' not in self._fitter_args:
+                    self._fitter_args['maxiter'] = 1000
+
+            if self._auto_reject:
+                fit_spec_mod, _, _, _ = spec_mod.rejection_criteria(
+                    self._redshift_model(x), y, auto_fit=True,
+                    fitter=self._fitter, fitter_args=self._fitter_args)
+            else:
+                fit_spec_mod = self._fitter(spec_mod, self._redshift_model(x),
+                                            y, **self._fitter_args)
+        else:
+            if self._auto_reject:
+                fit_spec_mod, _, _, _ = spec_mod.rejection_criteria(
+                    self._redshift_model(x), y, auto_fit=False)
+            else:
+                fit_spec_mod = spec_mod
+
+        # The parameter values on the underlying compound model must also be
+        # updated given the new fitted parameters on the Spectral1D instance.
+        # FIXME: when fitting without using line finder, these values will not
+        # be updated in the compound model.
+        for pn in fit_spec_mod.param_names:
+            pv = getattr(fit_spec_mod, pn)
+            setattr(fit_spec_mod._compound_model, pn, pv)
+
+        fit_spec_mod.line_regions = regions
+
+        self._model_result = fit_spec_mod
+
+        return fit_spec_mod(x)
+
+    def _discover_lines(self, x, y, mod, registry, regions, threshold,
+                        min_distance):
         lines = []
 
+        # First, calculate all the primary line profiles
         for centroid, (mn_bnd, mx_bnd), is_absorption, buried in regions.values():
             mn_bnd, mx_bnd = mn_bnd * x.unit, mx_bnd * x.unit
             sub_x, vel_mn_bnd, vel_mx_bnd = None, None, None
@@ -130,7 +197,7 @@ class LineFinder1D(Fittable2DModel):
             # velocity space individually to avoid making assumptions of their
             # kinematics.
             if x.unit.physical_type in ('length', 'frequency'):
-                line = sub_registry.with_lambda(centroid)
+                line = registry.with_lambda(centroid)
 
                 disp_equiv = u.spectral() + DOPPLER_CONVERT[
                     self._velocity_convention](line['wave'])
@@ -141,7 +208,7 @@ class LineFinder1D(Fittable2DModel):
                                                            mx_bnd.to('km/s'), \
                                                            centroid.to('km/s')
             else:
-                line = sub_registry.with_name(self._ions[0])
+                line = registry.with_name(self._ions[0])
 
             line_kwargs.update({
                 'name': line['name'],
@@ -152,11 +219,11 @@ class LineFinder1D(Fittable2DModel):
             # Estimate the doppler b and column densities for this line.
             # For the parameter estimator to be accurate, the spectrum must be
             # continuum subtracted.
-            v_dop, col_dens, nmn_bnd, nmx_bnd = parameter_estimator(
+            centroid, v_dop, col_dens, nmn_bnd, nmx_bnd = parameter_estimator(
                 centroid=centroid,
                 bounds=(vel_mn_bnd or mn_bnd, vel_mx_bnd or mx_bnd),
                 x=sub_x or x,
-                y=spec_mod.continuum(sub_x or x) - y if is_absorption else y,
+                y=mod.continuum(sub_x or x) - y if is_absorption else y,
                 ion_info=line_kwargs,
                 buried=buried)
 
@@ -199,46 +266,7 @@ class LineFinder1D(Fittable2DModel):
             "Found %s possible lines (theshold=%s, min_distance=%s).",
             len(lines), threshold, min_distance)
 
-        if len(lines) == 0:
-            return np.zeros(x.shape)
-
-        spec_mod = Spectral1D(lines,
-                              continuum=self._continuum,
-                              output=self._output,
-                              z=self._redshift_model.z.value)
-
-        if self._auto_fit:
-            if issubclass(self._fitter.__class__, LevMarLSQFitter):
-                if 'maxiter' not in self._fitter_args:
-                    self._fitter_args['maxiter'] = 1000
-
-            if self._with_rejection:
-                fit_spec_mod, _, _, _ = fit_spec_mod.rejection_criteria(
-                    self._redshift_model(x), y, auto_fit=True,
-                    fitter=self._fitter, fitter_args=self._fitter_args)
-            else:
-                fit_spec_mod = self._fitter(spec_mod, self._redshift_model(x),
-                                            y, **self._fitter_args)
-        else:
-            if self._with_rejection:
-                fit_spec_mod, _, _, _ = fit_spec_mod.rejection_criteria(
-                    self._redshift_model(x), y, auto_fit=False)
-            else:
-                fit_spec_mod = spec_mod
-
-        # The parameter values on the underlying compound model must also be
-        # updated given the new fitted parameters on the Spectral1D instance.
-        # FIXME: when fitting without using line finder, these values will not
-        # be updated in the compound model.
-        for pn in fit_spec_mod.param_names:
-            pv = getattr(fit_spec_mod, pn)
-            setattr(fit_spec_mod._compound_model, pn, pv)
-
-        fit_spec_mod.line_regions = regions
-
-        self._model_result = fit_spec_mod
-
-        return fit_spec_mod(x)
+        return lines
 
 
 def parameter_estimator(centroid, bounds, x, y, ion_info, buried=False):
@@ -250,14 +278,25 @@ def parameter_estimator(centroid, bounds, x, y, ion_info, buried=False):
     mask = ((x >= new_bound_low) & (x <= new_bound_up))
     mx, my = x[mask], y[mask]
 
-    # Width can be estimated by the weighted 2nd moment of the x coordinate
+    # X centroid estimates the position
+    centroid = np.sum(mx * my) / np.sum(my)
+
+    # width can be estimated by the weighted
+    # 2nd moment of the X coordinate.
     dx = mx - np.mean(mx)
     fwhm = 2 * np.sqrt(np.sum((dx * dx) * my) / np.sum(my))
     sigma = fwhm / 2.355
+    # sigma = sigma * 2 if buried else sigma
 
-    # Amplitude is derived from area
-    sum_y = np.trapz(my, x=mx)
-    height = sum_y / (sigma * np.sqrt(2 * np.pi))
+    # import matplotlib.pyplot as plt
+
+    # f, ax = plt.subplots()
+
+    # ax.plot(x, y)
+    # ax.plot(mx, my)
+
+    # amplitude is derived from area.
+    height = np.abs(np.max(y)) - np.abs(np.min(y))
 
     # Estimate the doppler b parameter
     v_dop = (np.sqrt(2) * sigma).to('km/s')
@@ -279,4 +318,4 @@ def parameter_estimator(centroid, bounds, x, y, ion_info, buried=False):
                                   ion_info['lambda_0'], ln_col_dens,
                                   col_dens, v_dop))
 
-    return v_dop, ln_col_dens, new_bound_low, new_bound_up
+    return centroid, v_dop, ln_col_dens, new_bound_low, new_bound_up
